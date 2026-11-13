@@ -21,7 +21,40 @@ The proposed fix is **Domain Mail Signing (DMS)**, written up as an Internet-Dra
 
 ### How a message flows
 
-Alice (`alice@domain.uk`) sends to Bob (`bob@recipient.example`) through a delivery hub:
+Alice (`alice@domain.uk`) sends to Bob (`bob@recipient.example`). Mail travels either directly between the two domains' servers, or through a delivery hub that `domain.uk` has authorised.
+
+#### Direct (peer to peer)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Alice's mail client
+    participant S as domain.uk<br/>sending server
+    participant DNS as DNS (DNSSEC)
+    participant R as recipient.example<br/>receiving server
+    participant B as Bob's mail client
+
+    A->>S: Submit over implicit TLS (465)<br/>+ optional Mail-User-Signature
+    S->>S: Add Mail-Signature (domain key, rd=recipients)<br/>+ Mail-Retention + Mail-Hop i=1
+    S->>DNS: Look up _dms-smtp._tcp.recipient.example
+    DNS-->>S: Receiving servers + port
+    S->>R: DMS relay on the dedicated port<br/>TLS 1.3, both ends authenticated
+    R->>DNS: Look up _mail keys, _dms-send hosts and policy
+    DNS-->>R: Keys, hosts, policy (DNSSEC-validated)
+    R->>R: Verify signature, certificate, rd=,<br/>the hop and its declaration
+    alt Verification fails
+        R-->>S: 550 5.7.x DMS <reason> (rejected in session)
+        S-->>A: Clear explanation of what failed
+    else Verification passes
+        R->>R: Add Mail-Retention + signed Mail-Delivered
+        R->>B: Deliver over IMAP / POP3 / Exchange / JMAP (TLS)
+        B->>B: Show the verified path and what each server keeps
+    end
+```
+
+#### Through a hub
+
+The hub (for example Amazon SES or Azure) must be listed in `domain.uk`'s `_mail` record (`h=`). It adds its own signed hop and retention declaration, and passes any failure back to the sending server as a signed report.
 
 ```mermaid
 sequenceDiagram
@@ -56,9 +89,9 @@ sequenceDiagram
 In words:
 
 1. **Sending.** Alice's client sends over an encrypted connection and can add her personal signature. The `domain.uk` server signs with the domain key, records which domains the message is for, declares what it keeps, and adds the first signed hop.
-2. **Relaying.** Every connection is TLS 1.3, and both ends prove who they are with keys published in DNS. The hub finds Bob's receiving servers through SRV records, delivers on the dedicated DMS port, and adds its own signed hop and retention declaration.
+2. **Relaying.** Every connection is TLS 1.3, and both ends prove who they are with keys published in DNS. Whichever server delivers to Bob, `domain.uk`'s own server or the hub, finds Bob's receiving servers through SRV records and delivers on the dedicated DMS port. A hub also adds its own signed hop and retention declaration.
 3. **Checking.** Bob's server checks everything before accepting: the sender's key and certificate, that the message was really addressed to it, every hop, and every declaration. Nothing is accepted first and bounced later.
-4. **Failing.** A rejection carries a clear, registered reason. It goes back along the authenticated path to the server that sent the message, which tells Alice what went wrong.
+4. **Failing.** A rejection carries a clear, registered reason. When the message was sent directly, the reason goes straight back to `domain.uk`'s server. When a hub delivered it, the hub returns a signed failure report to `domain.uk`'s sending server. Either way, that server tells Alice what went wrong.
 5. **Delivering.** Bob's server adds its own declaration and a signed `Mail-Delivered`. Bob's client can then show who sent the message, every server it passed through, any redirects, whether DNSSEC protected it, and what each party keeps.
 
 ## The problem
