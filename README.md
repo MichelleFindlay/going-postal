@@ -1,5 +1,10 @@
 # going-postal
 
+## About
+- A stupid idea ive had in my head to de-cluster-f*ck the e-mail stack for a few years.
+- I am aware it wont ever get better. But I can dream.
+- This is just a weird thought in my head i wanted to write down.
+
 ## The problem
 
 Sending an email looks simple. Doing it *correctly* in 2026 means implementing, or at least understanding, the documents listed below:
