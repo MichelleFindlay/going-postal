@@ -46,8 +46,10 @@ Copyright (c) 2026 IETF Trust and the persons identified as the document authors
    - 4.10 [`_user._mail` TXT: user keys](#410-user-keys-_user_mail)
    - 4.11 [DNSSEC](#411-dnssec)
 5. [Certificate Binding](#5-certificate-binding)
+   - 5.1 [Certificates and Extended Key Usage](#51-certificates-and-extended-key-usage)
 6. [The `Mail-Signature` Header Field](#6-the-mail-signature-header-field)
    - 6.5 [User signatures: `Mail-User-Signature`](#65-user-signatures-mail-user-signature)
+   - 6.6 [Intended recipients: `rd=`](#66-intended-recipients-rd)
 7. [The `Mail-Hop` Header Field](#7-the-mail-hop-header-field)
    - 7.5 [Data retention: `Mail-Retention`](#75-data-retention-mail-retention)
    - 7.6 [Final delivery: `Mail-Delivered`](#76-final-delivery-mail-delivered)
@@ -176,6 +178,7 @@ use-char     = %x21-2B / %x2D-3A / %x3C / %x3E-7E
                                          ; any visible ASCII except "," ";" "="
 scope        = %s"s=" ( %s"tree" / %s"self" )
 hub          = %s"h=" domain-name        ; hub authorisation; no k/a/p
+delegated    = %s"dh=" domain-name       ; key held by this Hub only
 expiry       = %s"x=" 1*12DIGIT          ; seconds since the Unix epoch
 ext-tag      = tag-name "=" tag-value    ; unknown tags MUST be ignored
 ```
@@ -191,7 +194,8 @@ ext-tag      = tag-name "=" tag-value    ; unknown tags MUST be ignored
 | `u` | No (default `mail`) | Permitted uses: a comma-separated list of free-form text values. Any string of up to 64 visible characters (other than `,`, `;` and `=`) is a valid use, so a domain can publish keys for any purpose in one place. Only the values in [Section 4.3.1](#431-usage-values) have meaning to DMS. |
 | `s` | No (default `tree`) | Scope. `tree` covers the domain and every subdomain that does not publish its own `_mail` records. `self` covers only the exact domain. |
 | `h` | For hub records | Domain of a Hub authorised to relay mail for this domain, inbound or outbound. A record with `h=` MUST NOT carry `k`, `a` or `p`. |
-| `x` | No | Expiry time. After it, verifiers MUST treat the key as revoked. |
+| `dh` | For delegated keys | Marks a `mail` key whose private half is held by a Hub ([Section 8.2](#82-via-a-hub)). The key is valid only when hop 1's `d=` is this Hub domain. |
+| `x` | No | Retirement time. After it, the key MUST NOT be used for new signatures. Signatures whose `t=` is earlier than `x=` remain verifiable, so retired keys keep old mail verifiable. To revoke a key because it is compromised, publish an empty `p=` instead. |
 
 #### 4.3.1. Usage Values
 
@@ -237,7 +241,7 @@ The `u=` tag is deliberately open-ended. `_mail` is the place where a domain pub
 | `rsa-pss-sha256` | MUST be supported by verifiers. Keys MUST be at least 2048 bits. |
 | `ed25519` | **Allowed, and intended for future use.** Verifiers MUST support it. Signers MAY use it wherever they can obtain an Ed25519 certificate from a trusted CA ([Section 5](#5-certificate-binding)). Until public CAs issue Ed25519 certificates widely, a domain using Ed25519 SHOULD also publish an ECDSA key, so that every verifier can validate at least one certificate chain. |
 
-New algorithms, including post-quantum signature algorithms, can be added by updating this table. Verifiers MUST ignore keys with an `a=` they do not support, rather than failing the whole record set.
+Post-quantum signature algorithms, such as composite ML-DSA certificates [RFC10073], are expected to be added to this table as CAs begin issuing them. Verifiers MUST ignore keys with an `a=` they do not support, rather than failing the whole record set.
 
 ### 4.4. Example
 
@@ -329,20 +333,22 @@ _dms-send._tcp.domain.uk. 3600 IN SRV 90       40      <dms-port>  out2.domain.u
 | **Protocol** `_tcp` | Sending and return traffic run over TCP with implicit TLS ([Section 9](#9-mandatory-encryption)). |
 | **Priority** | The domain's **policy persistence period** in days (0–65535; see [Section 4.8](#48-policy)). All `_dms-send._tcp` records for a domain SHOULD carry the same value. If they differ, verifiers MUST use the largest. |
 | **Weight** | Each host's relative share of the domain's outbound mail. Receivers MAY use it to spot anomalies, for example a host listed with weight 0 suddenly sending large volumes. Hubs and receivers also use it, as standard SRV weight [RFC2782], to choose which host to contact for return traffic. |
-| **Port** | The port on which the sending host accepts **return traffic** for mail it sent: failure reports and DSNs ([Section 10.1](#101-failure-reporting-and-bounces)). This uses the DMS relay protocol with mutual TLS, and SHOULD be `<dms-port>`. Port `0` means the host accepts no return traffic, and returns go to the domain's `_dms-smtp._tcp` servers instead. |
-| **Target** | The host name that the sending server presents in its TLS client certificate. |
+| **Port** | The port on which the sending host accepts **return traffic** for mail it sent: failure reports and DSNs ([Section 10.1](#101-failure-reporting-and-bounces)). This uses the DMS relay protocol with mutual TLS, and SHOULD be `<dms-port>`. Port `0` means the host accepts no return traffic, and returns go to the domain's `_dms-smtp._tcp` servers instead. The return port is a listening service and an attack surface. It MUST apply full verification ([Section 10](#10-verification-procedure)), MUST accept only null-`MAIL FROM` failure reports that refer to messages the host sent ([Section 10.1](#101-failure-reporting-and-bounces), step 5), and SHOULD be rate-limited. |
+| **Target** | The host name the sending server gives in `EHLO`. It must also appear in the server's relay certificate ([Section 5](#5-certificate-binding)). |
 
 The port makes each `_dms-send` record a genuine service location: the sending server can be reached at that host and port. Failures can therefore be returned directly to the server that sent the message, as [Section 10.1](#101-failure-reporting-and-bounces) requires.
 - A single record with target `.` (for example `SRV 365 0 0 .`) means the domain **sends no mail**. Its priority still sets the persistence period. Receivers MUST reject any message whose `From:` domain, `MAIL FROM` domain or `Mail-Signature` `d=` falls under that domain. This replaces both the `v=spf1 -all` and DMARC `p=reject` records that parked domains publish today.
 
 A domain that sends only through Hubs does not list the Hubs' hosts. The `h=` authorisation in `_mail` delegates to the Hub, and the Hub publishes its own `_dms-send._tcp` records.
 
-**Confirming the sending server.** When a server accepts a connection, it identifies the client domain `D` as the domain whose `u=relay` key matches the client certificate. That domain becomes the final hop's `d=` ([Section 10](#10-verification-procedure)). The receiver MUST then confirm both of the following:
+**Confirming the sending server.** The client authenticates in TLS with a raw public key ([Section 5.1](#51-certificates-and-extended-key-usage)) and names itself in `EHLO`. The receiver MUST confirm all of the following:
 
-1. The client certificate contains a `dNSName` equal to one of the targets of `_dms-send._tcp.D`.
-2. `D` publishes `_dms-send._tcp` records. If it publishes none, or only a `.` target, the receiver MUST reject the connection with `X.7.TBD3`.
+1. The `EHLO` host name is one of the targets of `_dms-send._tcp.D`, where `D` is the domain the client claims. `D` is found by walking up the `EHLO` name as in [Section 4.5](#45-discovery-and-the-domain-tree), and becomes the final hop's `d=` ([Section 10](#10-verification-procedure)).
+2. The TLS raw public key equals a `u=relay` key in `D`'s `_mail` records.
+3. `D` publishes `_dms-send._tcp` records. If it publishes none, or only a `.` target, the receiver MUST reject the connection with `X.7.TBD3`.
+4. At end-of-data, the certificate in the final `Mail-Hop` `c=` has the same SPKI and contains a `dNSName` for the `EHLO` host name ([Section 5](#5-certificate-binding)).
 
-A receiver MAY additionally check that the host name resolves (A/AAAA) to the connecting IP address. This is not required, because the certificate already proves the host's identity and large Hubs send from address pools.
+A receiver MAY additionally check that the host name resolves (A/AAAA) to the connecting IP address. This is not required, because the key already proves the host's identity and large Hubs send from address pools.
 
 This replaces SPF's IP-address allow-lists with named, certificate-backed hosts.
 
@@ -366,6 +372,8 @@ A domain's DMS policy is expressed by which records it publishes. No separate po
 - A value of `0` means the policy persists only for the records' TTL.
 - Servers MUST honour values up to 365 and MAY cap larger values at 365.
 - The policy is applied for the longer of the persistence period and the records' TTL, and the period restarts each time the records are seen again.
+- **The newest records always win.** Persistence only protects against records *disappearing*. Whenever records are present, servers use the newest validated records, including a changed target list, a lower persistence value, or a `.` target, and stored copies are replaced.
+- **`.` targets are not pinned.** "Sends no mail" and "accepts no mail" records persist only for their TTL. If an attacker briefly controls a domain's DNS and publishes them, the damage cannot outlive the domain's correction.
 
 A server MAY stop applying the policy before the period ends only if a DNSSEC-validated response proves that the records no longer exist.
 
@@ -424,6 +432,7 @@ Domains that publish DMS records are RECOMMENDED to sign their zones with DNSSEC
 2. Hubs SHOULD sign their zones. They carry other domains' mail, and their keys and SRV records are relied on by every domain that authorises them.
 3. Zones that publish user keys SHOULD use NSEC3 configured as in [RFC9276], or online signing with compact denial of existence, to limit enumeration of `_user._mail` names ([Section 15](#15-privacy-considerations)).
 4. Domains SHOULD sign their zones before entering Phase 3 of the transition ([Section 12](#12-transition-and-coexistence)).
+5. **First contact.** The persistence rule ([Section 4.8](#48-policy)) only protects a domain after a sender has seen its records once. Before that, an attacker who strips the SRV answer from an **unsigned** zone can force legacy delivery. A Phase 3 domain whose zone is not DNSSEC-signed MUST therefore register in the DMS Preload List ([Section 13.11](#1311-dms-preload-list)). Senders MUST treat preloaded domains as enforcing even before their first lookup. Signed zones need no preload, because DNSSEC's authenticated denial already defeats stripping.
 
 **Verifiers** (sending servers, receiving servers and mail clients):
 
@@ -443,24 +452,35 @@ Domains that publish DMS records are RECOMMENDED to sign their zones with DNSSEC
 
 ## 5. Certificate Binding
 
-DMS uses the existing public certificate infrastructure as a second, independent trust anchor alongside DNS.
+DMS uses the existing public certificate infrastructure as a second, independent trust anchor alongside DNS. The certificate serves **only as CA-attested proof that the domain controls the key**. It is not used as a TLS client credential (see [Section 5.1](#51-certificates-and-extended-key-usage)).
 
 1. Every key with `u` containing `mail`, `relay` or `any` MUST have its `SubjectPublicKeyInfo` contained in an X.509 certificate [RFC5280] that:
    - chains to a root in the verifier's Web PKI trust store;
    - contains a `dNSName` SubjectAltName equal to the domain at which the `_mail` record was found, or a wildcard covering it;
-   - is currently valid and not revoked;
-   - carries at least two valid Signed Certificate Timestamps [RFC9162].
+   - was valid at the signature time `t=`, and has not been revoked for key compromise ([Section 14.3](#143-key-compromise-rotation-and-historic-verification));
+   - carries at least two valid Signed Certificate Timestamps [RFC9162];
+   - for `relay` keys, also contains a `dNSName` for each `_dms-send._tcp` target and `_dms-smtp._tcp` target that uses the key.
 2. The certificate MAY be the same certificate the domain already uses for HTTPS (`u=web`), so a domain can reuse what it already has. Separate keys per use are RECOMMENDED; see [Section 14.4](#144-key-reuse).
 3. A forged DNS record is useless without a CA-issued certificate for the same key. A mis-issued certificate is useless without control of the domain's DNS. An attacker must compromise both.
 4. Every **user key** ([Section 4.10](#410-user-keys-_user_mail)) MUST have its `SubjectPublicKeyInfo` contained in an X.509 certificate that:
    - contains an `rfc822Name` SubjectAltName, or an `SmtpUTF8Mailbox` for internationalised addresses [RFC9598], equal to the user's address;
    - permits email protection, as an S/MIME certificate does [RFC8550];
    - chains to a root that the verifier trusts for email;
-   - is currently valid and not revoked.
+   - was valid at the signature time `t=`, and has not been revoked for key compromise.
 
    This is the existing S/MIME certificate infrastructure, and CAA for email addresses [RFC9495] applies. The same certificate MAY also be used for S/MIME.
 
 The signer includes the leaf certificate in the `c=` tag of `Mail-Signature`, `Mail-User-Signature` or `Mail-Hop`, so verifiers do not need to fetch it. Intermediate certificates MAY be included in `c=` as a comma-separated list, leaf first.
+
+### 5.1. Certificates and Extended Key Usage
+
+Public CAs are removing the TLS client-authentication EKU (`id-kp-clientAuth`) from Web PKI certificates. Root-program rules now require serverAuth-only hierarchies. DMS therefore never relies on a Web PKI certificate to authenticate a TLS **client**:
+
+1. **Raw public keys for relay clients.** A sending server authenticates in TLS with a raw public key [RFC7250], not a certificate. Its identity is the `SubjectPublicKeyInfo` itself, which the receiver matches against a `u=relay` key in the claimed domain's `_mail` records ([Section 4.7](#47-sending-servers-_dms-send_tcp)).
+2. **CA proof carried in the message.** The CA's attestation for that same key travels in the `c=` tag of the sender's `Mail-Hop`. The receiver checks it at end-of-data, under the rules above, and confirms that its SPKI equals the raw public key used in the TLS session.
+3. **No EKU requirement.** Verifiers MUST NOT require any particular EKU on DMS certificates. They are checked for chain validity, names, validity time and Certificate Transparency, not for TLS usage.
+4. **Servers.** Receiving servers present ordinary Web PKI serverAuth certificates, which remain widely available ([Section 4.6](#46-receiving-servers-_dms-smtp_tcp)).
+5. **Dedicated EKU.** This document requests an EKU for DMS signing (`id-kp-dmsSigning`, [Section 13.10](#1310-extended-key-usage)). CAs and subscribers SHOULD move to dedicated DMS certificates as they become available, rather than reusing serverAuth certificates for message signing, which some CA subscriber agreements may not permit.
 
 ## 6. The `Mail-Signature` Header Field
 
@@ -474,13 +494,15 @@ The signer includes the leaf certificate in the `c=` tag of `Mail-Signature`, `M
 mail-signature = "Mail-Signature:" [FWS] ms-tag-list CRLF
 ms-tag-list    = ms-tag *( [FWS] ";" [FWS] ms-tag ) [ [FWS] ";" ]
 ms-tag         = %s"v=1" / sig-d / sig-k / sig-a / sig-t / sig-h / sig-bh
-               / sig-c / sig-b / ext-tag
+               / sig-rd / sig-c / sig-b / ext-tag
 sig-d  = %s"d="  domain-name     ; Signing Domain
 sig-k  = %s"k="  key-id          ; matches k= in the _mail record
 sig-a  = %s"a="  alg
 sig-t  = %s"t="  1*12DIGIT       ; signing time, Unix epoch seconds
 sig-h  = %s"h="  hdr-name *( ":" hdr-name )   ; signed header fields
 sig-bh = %s"bh=" base64          ; SHA-256 of the canonical body
+sig-rd = %s"rd=" rd-hash *( "," rd-hash )      ; intended recipient domains
+rd-hash = 22base64url            ; see Section 6.6
 sig-c  = %s"c="  base64-der *( "," base64-der )   ; certificate(s)
 sig-b  = %s"b="  base64          ; signature
 ```
@@ -514,6 +536,23 @@ mus-u     = %s"u=" addr-spec          ; the signing user's address
 - **Display.** The receiving MDA keeps the header field. A user's mail client MAY re-verify it and show the message as signed by that individual, as distinct from merely sent from the domain.
 
 User signatures prove *who* wrote a message. They do not encrypt it. End-to-end encryption, so that providers and Hubs cannot read the content, remains the job of S/MIME [RFC8551] and OpenPGP [RFC9580], which can use the same certificate.
+
+### 6.6. Intended Recipients: `rd=`
+
+The `rd=` tag binds a signature to the recipient domains the sender actually addressed. This prevents **replay**: an attacker who receives one validly signed message cannot re-send it to other domains.
+
+- `rd=` is REQUIRED. It lists one entry for each recipient domain of **this copy** of the message.
+- Each entry is computed as:
+
+  ```
+  base64url( first 16 octets of SHA-256( "DMS1 rcpt\0" || lowercase(domain) || "\0" || Message-ID ) )
+  ```
+
+  Hashing with the `Message-ID` hides the recipient domains from other readers and prevents entries from being matched across messages.
+- Originating MTAs SHOULD sign each per-domain copy separately, so that `rd=` lists only that copy's domain. This avoids revealing, even in hashed form, how many other domains, including `Bcc:` domains, received the message.
+- A receiver accepts the message only if it is an intended recipient ([Section 10](#10-verification-procedure), step 6). That means either its own domain matches an `rd=` entry, or the message carries a valid chain of `Mail-Redirect` fields ([Section 11.1](#111-redirection-mail-redirect)) that starts at a domain matching an `rd=` entry and ends at the receiver. Otherwise the message is rejected with reason `recipient-not-intended`.
+
+Replaying to a new domain would therefore require either the original sender's key or a signed `Mail-Redirect` from a genuine recipient, which names the replaying domain to every reader.
 
 ## 7. The `Mail-Hop` Header Field
 
@@ -615,7 +654,7 @@ All seven categories MUST be declared. Omitting one is an error, so that silence
 | `purpose` | Yes, if anything is retained | Why data is retained, using values from the DMS Retention Purposes registry ([Section 13.9](#139-dms-retention-purposes)), for example `delivery`, `security`, `abuse`, `legal` or `billing`. |
 | `loc` | Yes, if anything is retained | The countries where retained data is stored. |
 | `share` | Yes | Third parties that receive any retained data, or `none`. |
-| `policy` | RECOMMENDED | An HTTPS URL for the server's full retention and logging policy. |
+| `policy` | RECOMMENDED | An HTTPS URL for the server's full retention and logging policy. Clients MUST NOT fetch it automatically ([Section 10.2](#102-verification-and-display-by-mail-clients)). |
 
 #### 7.5.5. Example
 
@@ -638,6 +677,14 @@ This reads: the Hub keeps the sender and recipient addresses and other header fi
 5. Mail clients SHOULD make declarations visible to users ([Section 10.2](#102-verification-and-display-by-mail-clients)).
 
 ### 7.6. Final Delivery: `Mail-Delivered`
+
+**Removing injected fields.** Before verification, a receiving server MUST remove from an incoming message:
+
+- every `Mail-Delivered` field, because only the final receiver adds one;
+- any `Mail-Retention` or `Mail-Redirect` whose `i=` matches no `Mail-Hop`;
+- any DMS field placed above the topmost `Mail-Hop`.
+
+It SHOULD record that it did so in its internal logs. This prevents a sender from planting a forged `Mail-Delivered` or a misleading declaration for the recipient's mail client to display. It is the same principle as removing foreign `Authentication-Results` fields today.
 
 After a message passes verification ([Section 10](#10-verification-procedure)), the final receiving server MUST prepend a `Mail-Delivered` field and its own `Mail-Retention` before handing the message to the mailbox. This is the receiving domain's signed confirmation that it received and verified the message. It lets the recipient's mail client confirm the authenticity of the receiving domain as well as the sender.
 
@@ -671,7 +718,7 @@ The originating MTA resolves the recipient domain's `_dms-smtp._tcp` SRV records
 A domain that uses a delivery service publishes `h=<hub domain>` in its `_mail` records. Hubs include existing services such as Amazon SES on AWS and the email services on Azure. The domain then either:
 
 - **(a) Signs locally.** The domain's own MSA/MTA adds `Mail-Signature` and `Mail-Hop i=1 to=<hub>`, and the Hub adds `Mail-Hop i=2`. Or:
-- **(b) Delegates signing.** The domain publishes, under its own `_mail` name, a `u=mail` key whose private half is held by the Hub. The certificate for that key MUST still name the domain. The Hub then adds both `Mail-Signature` and `Mail-Hop i=1`.
+- **(b) Delegates signing.** The domain publishes, under its own `_mail` name, a `u=mail` key whose private half is held by the Hub. The record MUST carry `dh=<hub domain>`, and SHOULD carry an `x=` no more than 90 days ahead, renewed as the Hub rotates keys. The certificate for that key MUST still name the domain. The Hub then adds both `Mail-Signature` and `Mail-Hop i=1`. Because of `dh=`, a stolen delegated key cannot be used from anywhere except that Hub's authenticated servers.
 
 The Hub authenticates to the next server with its own certificate and signs its `Mail-Hop` with its own `u=relay` key published at `_mail.<hub domain>`. The Hub's sending hosts are listed in `_dms-send._tcp.<hub domain>`.
 
@@ -683,15 +730,17 @@ Hubs MAY chain: a Hub may relay to another Hub authorised by the recipient domai
 
 DMS removes cleartext from every part of the mail system.
 
-1. **Relay (MTA to MTA, MTA to Hub, Hub to MX).** Connections are made to the dedicated DMS port ([Section 13.4](#134-service-names-and-port)), not port 25. They MUST use TLS 1.3 [RFC8446] or later from the first octet ("implicit TLS"). The TLS ALPN identifier `dms-smtp` is used ([Section 13](#13-iana-considerations)). Both sides MUST present certificates:
+1. **Relay (MTA to MTA, MTA to Hub, Hub to MX).** Connections are made to the dedicated DMS port ([Section 13.4](#134-service-names-and-port)), not port 25. They MUST use TLS 1.3 [RFC8446] or later from the first octet ("implicit TLS"). The TLS ALPN identifier `dms-smtp` is used ([Section 13](#13-iana-considerations)). Both sides MUST authenticate:
    - The server presents a certificate for its `_dms-smtp._tcp` target host name, confirmed as described in [Section 4.6](#46-receiving-servers-_dms-smtp_tcp).
-   - The client presents a certificate for one of its domain's `_dms-send._tcp` targets, whose key appears in a `u=relay` record of that domain. The receiver confirms it as described in [Section 4.7](#47-sending-servers-_dms-send_tcp).
+   - The client presents a raw public key [RFC7250] that appears in a `u=relay` record of its domain. The receiver confirms it as described in [Section 4.7](#47-sending-servers-_dms-send_tcp). CA attestation for the key arrives in the message ([Section 5.1](#51-certificates-and-extended-key-usage)).
 
    STARTTLS MUST NOT be used. A server MUST NOT accept SMTP commands before the TLS handshake completes.
 2. **Client connections.** Mail clients submit and retrieve mail only through the connections listed in [Section 9.1](#91-permitted-connections). Each one is encrypted from the first octet.
 3. **Authentication.** Credentials are only ever sent inside TLS. Servers MUST NOT offer mechanisms that are weak even inside TLS ([Section 9.2](#92-prohibited-mechanisms)).
 4. **No fallback.** If a TLS connection cannot be established or authenticated, the sender MUST NOT try any less secure alternative. It MUST queue the message and retry, and after the retry period MUST generate a delivery status notification [RFC3464].
 5. **Minimum parameters.** Cipher suites and parameters follow [RFC9325].
+6. **No early data.** TLS 1.3 0-RTT early data [RFC8446] MUST NOT be sent or accepted on any DMS connection: relay, the return-traffic port, submission or access. Early data can be replayed by an attacker.
+7. **Post-quantum key exchange.** Mail captured in transit today could be decrypted later by a quantum computer. DMS connections SHOULD use a post-quantum/traditional hybrid key exchange [RFC10024], such as `X25519MLKEM768`. A future revision of this document is expected to make this REQUIRED.
 
 Encryption is a property of the protocol, not a policy a domain opts into. This makes mechanisms that exist only to signal or enforce TLS redundant.
 
@@ -732,6 +781,7 @@ The following MUST NOT be offered or used on any connection in [Section 9.1](#91
 | NTLM, and HTTP Basic authentication to Exchange | NTLM is weak and relay-prone. Basic authentication sends a reusable password on every request. |
 | RPC over HTTP (Outlook Anywhere) | A legacy Exchange transport, replaced by MAPI over HTTP. |
 | TLS 1.2 and earlier on server-to-server relay | Below the minimum set in item 1 of [Section 9](#9-mandatory-encryption). |
+| TLS 1.3 0-RTT early data | Replayable. See item 6 of [Section 9](#9-mandatory-encryption). |
 
 The permitted authentication mechanisms are `OAUTHBEARER` [RFC7628], `SCRAM-SHA-256` and `SCRAM-SHA-256-PLUS` [RFC7677], `GSSAPI`/Kerberos [RFC4752], OAuth 2.0 for Exchange and JMAP, and `PLAIN` [RFC4616]. Because `PLAIN` is only ever carried inside TLS, it is acceptable, but `OAUTHBEARER` or `SCRAM` is RECOMMENDED.
 
@@ -739,17 +789,18 @@ The permitted authentication mechanisms are `OAUTHBEARER` [RFC7628], `SCRAM-SHA-
 
 A receiving server (MX), before accepting responsibility for a message (that is, before replying `250` to end-of-data), MUST:
 
-1. **Check the transport.** It MUST have reached this step over TLS 1.3 or later with a valid client certificate. The sending host MUST have been confirmed against `_dms-send._tcp` ([Section 4.7](#47-sending-servers-_dms-send_tcp)).
+1. **Check the transport.** It MUST have reached this step over TLS 1.3 or later, with a client raw public key matching a `u=relay` key. The sending host MUST have been confirmed against `_dms-send._tcp` ([Section 4.7](#47-sending-servers-_dms-send_tcp)).
 2. **Locate the signature.** It extracts exactly one `Mail-Signature`. Missing or duplicate signatures fail with `550 5.7.TBD1`.
-3. **Fetch the key.** It resolves `_mail.<d>` using the walk in [Section 4.5](#45-discovery-and-the-domain-tree) and selects the record with matching `k=`, a `u` that includes `mail` or `any`, no expiry in the past and a non-empty `p=`.
+3. **Fetch the key.** It resolves `_mail.<d>` using the walk in [Section 4.5](#45-discovery-and-the-domain-tree) and selects the record with matching `k=`, a `u` that includes `mail` or `any`, and a non-empty `p=`. If the record has `x=`, the signature's `t=` MUST be earlier than `x=`.
 4. **Check the certificate.** It validates the certificate in `c=` as described in [Section 5](#5-certificate-binding) and confirms that its SPKI equals `p=`.
 5. **Verify the signature.** It verifies `b=` and `bh=`, then checks alignment ([Section 6.4](#64-alignment)). If the Signing Domain publishes `_dms-send._tcp` with target `.`, it rejects the message.
 6. **Verify the hop chain.** It verifies every `Mail-Hop` in turn:
    - `i=` values are contiguous from 1;
    - each signature is valid under a `u=relay` key of `d=`, with the certificate checked as in step 4;
    - each hop is authorised ([Section 7.4](#74-hop-authorisation));
-   - the final hop's `d=` equals the identity authenticated by the current TLS client certificate;
-   - the final hop's `to=` equals the receiving domain or a domain that authorises the receiver as a Hub.
+   - the final hop's `d=` equals the domain authenticated in TLS, and its `c=` certificate's SPKI equals the TLS raw public key;
+   - the final hop's `to=` equals the receiving domain or a domain that authorises the receiver as a Hub;
+   - the receiving domain is an **intended recipient**: it matches an `rd=` entry in `Mail-Signature`, or is reached through a valid `Mail-Redirect` chain from a domain that does ([Section 6.6](#66-intended-recipients-rd)).
 7. **Verify the user signature, if present.** It verifies `Mail-User-Signature` as described in [Section 6.5](#65-user-signatures-mail-user-signature).
 8. **Check declarations and redirects.** Every `Mail-Hop` has a valid `Mail-Retention` ([Section 7.5](#75-data-retention-mail-retention)), and every `Mail-Redirect` is valid ([Section 11.1](#111-redirection-mail-redirect)).
 9. **Check freshness.** It rejects signatures with `t=` more than 15 minutes in the future, and MAY reject messages whose `t=` is older than a locally configured limit (RECOMMENDED: 7 days).
@@ -807,6 +858,8 @@ The receiving MDA MUST keep every DMS header field when storing the message:
 
 A mail client can therefore re-verify the whole chain itself, using the same DNS lookups and certificates, without trusting the server that stored the message.
 
+**Which `Mail-Delivered` to trust.** A client MUST trust only the **topmost** `Mail-Delivered`, and only when its `d=` is the user's own mail domain, configured in the client or learned from the account, and its signature verifies. A client MUST ignore any other `Mail-Delivered` field, and any DMS field that the chain beneath that `Mail-Delivered` does not cover.
+
 Mail clients SHOULD offer the user a delivery summary built from these fields, showing for each party its domain, whether its signature verified, whether its DNS records were DNSSEC-validated, and what it declared it keeps. For example:
 
 ```
@@ -818,6 +871,10 @@ Mail clients SHOULD offer the user a delivery summary built from these fields, s
 ```
 
 Where a party declares that it keeps `body` or `attachments` beyond `0`, keeps anything `indef`, or shares data with third parties, clients SHOULD highlight it.
+
+**Lookalike domains.** DMS proves *which* domain sent a message, not that it is the domain the reader expects. Before showing a domain as verified, clients SHOULD apply confusable-character and mixed-script checks to internationalised domain names, as in Unicode UTS #39. Where a check fails, they SHOULD display the A-label (`xn--…`) or a warning. "Verified" must never be read as "trustworthy".
+
+**No automatic fetching.** Clients MUST NOT fetch `policy=` URLs or any other URL found in DMS fields automatically. A sender could use them to track whether a message was opened. They MAY be fetched on explicit user action.
 
 ## 11. Forwarding and Mailing Lists
 
@@ -858,7 +915,7 @@ Mail-Redirect: i=2; d=old.example; to=new.example;
 4. `orig=` and `new=` MAY carry the full addresses. A redirecting server SHOULD include them when the recipient has configured the redirect personally, as with an alias or forwarding rule. It MAY omit them for organisation-wide redirects where the addresses would reveal internal routing.
 5. The `Mail-Redirect` is signed with the redirecting domain's `u=relay` key, using the context string `"DMS1 redirect\0"` over the same content as its `Mail-Hop` ([Section 7.3](#73-signed-content)). It is also covered by that `Mail-Hop` signature.
 6. The **redirecting domain** is authenticated by the `Mail-Redirect` signature. The **new domain** is authenticated by its `Mail-Delivered` signature ([Section 7.6](#76-final-delivery-mail-delivered)), whose `d=` MUST match the last `Mail-Redirect`'s `to=`, or the new domain's own onward redirect. A mail client can therefore confirm both.
-7. A receiver MUST reject a message whose `Mail-Redirect` is missing where a hop's `d=` differs from the next hop's destination domain because of a redirect, or whose `Mail-Redirect` fails any of these checks (`redirect-invalid`).
+7. A `Mail-Redirect` is REQUIRED whenever a server sends the message on to a domain that does not match an `rd=` entry ([Section 6.6](#66-intended-recipients-rd)). Each redirect's `d=` MUST match an `rd=` entry or the `to=` of an earlier redirect, so the chain is unbroken. A receiver MUST reject a message whose redirect chain is missing, broken, or fails any of these checks (`redirect-invalid`), or that reaches a domain outside the chain (`recipient-not-intended`).
 
 Mail clients SHOULD show redirects prominently, for example "Redirected by old.example to new.example", next to the verified sender. The user can then tell that the message reached them through another domain and confirm that both domains were genuine.
 
@@ -977,6 +1034,8 @@ IANA is requested to create a "DMS Failure Reasons" registry, with the registrat
 | `receiver-not-confirmed` | 4.7.TBD4 | The receiving server is not confirmed by the recipient's DNS. Reported to the user only after retries. |
 | `dns-temporary` | 4.7.TBD4 | A DNS lookup failed temporarily. The message will be retried. |
 | `dnssec-bogus` | 5.7.TBD2 | The sending domain's DNS records failed DNSSEC validation. |
+| `recipient-not-intended` | 5.7.TBD2 | This message was not addressed to this domain. It may be a replay of someone else's mail. |
+| `dh-mismatch` | 5.7.TBD2 | A Hub-held key was used by a server other than the authorised Hub. |
 | `retention-missing` | 5.7.TBD2 | A server that handled the message did not declare what data it keeps. |
 | `retention-invalid` | 5.7.TBD2 | A server's data retention declaration is malformed or incomplete. |
 | `redirect-invalid` | 5.7.TBD2 | The message was redirected, but the redirect record is missing or does not verify. |
@@ -1002,6 +1061,16 @@ IANA is requested to create a "DMS Retention Purposes" registry, with the regist
 | `training` | Training or improving automated systems, including machine-learning models |
 | `other` | Any purpose not listed. The `policy=` URL MUST explain it. |
 
+### 13.10. Extended Key Usage
+
+IANA is requested to assign an object identifier for `id-kp-dmsSigning` in the "SMI Security for PKIX Extended Key Purpose" registry. It marks certificates issued for DMS domain, relay and user signing keys ([Section 5.1](#51-certificates-and-extended-key-usage)). Verifiers MUST accept DMS certificates with or without it.
+
+### 13.11. DMS Preload List
+
+A public, append-mostly list of domains that enforce DMS, for use by senders before their first DNS lookup ([Section 4.11](#411-dnssec)). It works like the browser HSTS preload list. Inclusion requires that the domain currently publishes `_dms-send._tcp` and `_dms-smtp._tcp` with a persistence period of at least 180 days. Removal takes effect only after a published delay.
+
+**Note to IANA and the IESG:** who operates this list, and how it is distributed, is an open issue (Appendix B).
+
 ## 14. Security Considerations
 
 ### 14.1. DNS Compromise
@@ -1012,9 +1081,19 @@ An attacker who controls a domain's DNS but cannot obtain a CA-issued certificat
 
 A mis-issued certificate does not help an attacker who cannot also publish the matching key in `_mail`. Certificate Transparency makes mis-issuance detectable after the fact.
 
-### 14.3. Key Compromise and Rotation
+### 14.3. Key Compromise, Rotation and Historic Verification
 
-A compromised key is revoked by removing its record, or by publishing it with an empty `p=`, and by revoking its certificate. Domains SHOULD rotate keys at least as often as their certificates, pre-publishing the next key as shown in [Section 4.4](#44-example).
+DMS distinguishes **rotation**, which is routine, from **compromise**:
+
+- **Rotation.** The domain sets `x=` on the old key to the time it stops signing with it. It keeps the record published, with its certificate, for at least one year afterwards (RECOMMENDED), so that clients can still verify older mail. Certificates are checked for validity **at the signature time `t=`**, not at the time of verification. Shortening Web PKI lifetimes, falling to 47 days by 2029, would otherwise make every older message fail verification.
+- **Compromise.** The domain publishes the key with an empty `p=` and revokes the certificate with reason `keyCompromise`. Every signature by that key then fails, whatever its `t=`, which is the intended effect.
+
+Domains SHOULD rotate keys at least as often as their certificates, pre-publishing the next key as shown in [Section 4.4](#44-example).
+
+**Mail clients and old messages.** A client SHOULD verify a message when it first retrieves it and store the result. When re-verifying later:
+
+- if a key or certificate can no longer be found because it was retired, the client SHOULD rely on the stored result, or on its trusted `Mail-Delivered` ([Section 10.2](#102-verification-and-display-by-mail-clients)), and MUST NOT present the message as forged;
+- only an explicit revocation (empty `p=`, or `keyCompromise`) justifies downgrading a previously verified message.
 
 ### 14.4. Key Reuse
 
@@ -1022,7 +1101,11 @@ This document allows one key to serve web TLS (`u=web`) and mail signing (`u=mai
 
 ### 14.5. Replay
 
-A validly signed message can be re-sent to other recipients. The hop chain limits this: a replayed message carries a final hop that the replaying server cannot sign as the original path. Receivers MAY also de-duplicate on `Message-ID` together with `Mail-Signature` `b=`.
+In "DKIM replay" attacks seen today, a spammer obtains one validly signed message and re-sends it to large numbers of other recipients. DMS prevents this:
+
+- The `rd=` tag binds the domain signature to the recipient domains the sender addressed ([Section 6.6](#66-intended-recipients-rd)). Any other domain rejects the message (`recipient-not-intended`).
+- Legitimate forwarding to another domain needs a signed `Mail-Redirect` from a genuine recipient. A replaying domain therefore has to sign the redirect itself, which names it and makes it accountable.
+- Within an intended domain, receivers SHOULD de-duplicate on `Message-ID` together with `Mail-Signature` `b=`, and the freshness limit ([Section 10](#10-verification-procedure), step 9) bounds how long a message can be replayed.
 
 ### 14.6. Hub Trust
 
@@ -1030,7 +1113,7 @@ Authorising a Hub with `h=` lets that Hub send mail that appears to come from th
 
 ### 14.7. Denial of Service
 
-Verifiers SHOULD cap the number of `Mail-Hop` fields (RECOMMENDED: 32), the size of `c=` and the number of DNS queries per message. They SHOULD also cap the number of SRV targets examined per domain (RECOMMENDED: 16).
+Verifiers SHOULD cap the number of `Mail-Hop` fields (RECOMMENDED: 10), the number of `Mail-Redirect` fields (RECOMMENDED: 5), the size of `c=` and the number of DNS queries per message. They SHOULD also cap the number of SRV targets examined per domain (RECOMMENDED: 16). Verifiers SHOULD cache DNS answers, certificate-chain results and revocation status, and SHOULD check the cheapest conditions first (transport, then `rd=`, then signatures), so that a malicious sender cannot make them do expensive work before cheap checks fail.
 
 ### 14.8. SRV Spoofing and Policy Downgrade
 
@@ -1097,6 +1180,7 @@ Operators SHOULD declare conservatively. If there is doubt about whether somethi
 - [RFC8126] Cotton, M., Leiba, B., and T. Narten, "Guidelines for Writing an IANA Considerations Section in RFCs", BCP 26, RFC 8126.
 - [RFC8174] Leiba, B., "Ambiguity of Uppercase vs Lowercase in RFC 2119 Key Words", BCP 14, RFC 8174.
 - [RFC8314] Moore, K. and C. Newman, "Cleartext Considered Obsolete: Use of TLS for Email Submission and Access", RFC 8314. — [local copy](../rfc/rfc8314.txt)
+- [RFC7250] Wouters, P., Ed., et al., "Using Raw Public Keys in Transport Layer Security (TLS) and Datagram Transport Layer Security (DTLS)", RFC 7250.
 - [RFC8446] Rescorla, E., "The Transport Layer Security (TLS) Protocol Version 1.3", RFC 8446.
 - [RFC8552] Crocker, D., "Scoped Interpretation of DNS Resource Records through Underscored Naming of Attribute Leaves", BCP 222, RFC 8552.
 - [RFC3461] Moore, K., "SMTP Service Extension for Delivery Status Notifications (DSNs)", RFC 3461. — [local copy](../rfc/rfc3461.txt)
@@ -1131,6 +1215,9 @@ Operators SHOULD declare conservatively. If there is doubt about whether somethi
 - [RFC8659] DNS Certification Authority Authorization (CAA) Resource Record.
 - [RFC8689] SMTP Require TLS Option. — [local copy](../rfc/rfc8689.txt)
 - [RFC9276] Guidance for NSEC3 Parameter Settings.
+- [RFC10024] Post-Quantum Traditional (PQ/T) Hybrid Key Agreement Mechanisms for TLS 1.3.
+- [RFC10073] Composite Module-Lattice-Based Digital Signature Algorithm (ML-DSA) for Use in X.509 Public Key Infrastructure.
+- [UTS39] Unicode Technical Standard #39, "Unicode Security Mechanisms".
 - [RFC8551] S/MIME Version 4.0 Message Specification. — [local copy](../rfc/rfc8551.txt)
 - [RFC9057] Email Author Header Field. — [local copy](../rfc/rfc9057.txt)
 - [RFC9580] OpenPGP. — [local copy](../rfc/rfc9580.txt)
@@ -1192,7 +1279,7 @@ Mail-Hop: i=1; d=domain.uk; k=2026a; a=ecdsa-p256-sha256;
   t=1794571260; to=amazonses.com; tls=TLSv1.3;
   c=MIIB…; b=MEQCIA…
 Mail-Signature: v=1; d=domain.uk; k=2026a; a=ecdsa-p256-sha256;
-  t=1794571259;
+  t=1794571259; rd=Vv1yC2m0q8XyB1a3kLp0tw;
   h=from:to:cc:date:subject:message-id:mime-version:content-type;
   bh=2jUSOH9NhtVGCQWNr9BrIAPreKQjO6Sn7XIkfJVOzv8=;
   c=MIIB…; b=MEYCIQ…
@@ -1213,8 +1300,8 @@ Are you free on Tuesday?
 
 **Verification at `mx.recipient.example`**
 
-1. The TLS client certificate names `smtp-out.amazonses.com`, which is a target of `_dms-send._tcp.amazonses.com`, and its key matches `k=r7`. ✔ `domain.uk` publishes `_dms-send._tcp`, so its policy is enforcing. ✔
-2. `Mail-Signature` `d=domain.uk`, `k=2026a`: the key is found at `_mail.domain.uk`, the certificate is valid for `domain.uk` with a matching SPKI, the signature verifies, and `From:` aligns. ✔
+1. The client says `EHLO smtp-out.amazonses.com`, which is a target of `_dms-send._tcp.amazonses.com`, and its TLS raw public key matches `k=r7`. ✔ `domain.uk` publishes `_dms-send._tcp`, so its policy is enforcing. ✔
+2. `Mail-Signature` `d=domain.uk`, `k=2026a`: the key is found at `_mail.domain.uk`, the certificate was valid for `domain.uk` at `t=` with a matching SPKI, the signature verifies, and `From:` aligns. ✔ One `rd=` entry matches `recipient.example` with this `Message-ID`, so the domain is an intended recipient. ✔
 3. Hop 1, `d=domain.uk`, is the Signing Domain. ✔ Its `to=amazonses.com` is authorised by `h=amazonses.com`. ✔
 4. Hop 2, `d=amazonses.com`, equals hop 1's `to=`. ✔ It matches the TLS peer, and its `to=recipient.example` is the receiving domain. ✔
 5. Hops 1 and 2 each have a complete `Mail-Retention`, covered by their hop signatures. ✔ All records were DNSSEC-validated. ✔
@@ -1242,8 +1329,8 @@ Once verified, `new.example` adds `Mail-Delivered: i=4; d=new.example; …`. Bob
 
 ## Appendix B. Open Issues
 
-- Should the hop chain cover the envelope (`MAIL FROM`/`RCPT TO`) explicitly, to bind messages more tightly against replay?
 - How should local parts be normalised before hashing for user keys ([Section 4.10](#410-user-keys-_user_mail))? Case, Unicode normalisation for internationalised addresses, and sub-addressing (`alice+tag`) all affect which record is looked up.
+- Who operates the DMS Preload List ([Section 13.11](#1311-dms-preload-list)), and how is it distributed to senders?
 - Should a domain be able to *require* user signatures for some or all of its addresses, for example with a tag in `_mail`?
 
 ### B.1. Resolved in this revision
@@ -1254,6 +1341,10 @@ Once verified, `new.example` adds `Mail-Delivered: i=4; d=new.example; …`. Bob
 | Normative or informative reference for Exchange? | Informative only ([Section 9.1](#91-permitted-connections)). |
 | Fixed or domain-set policy persistence? | Set by the domain in the `_dms-send._tcp` SRV priority field ([Section 4.8](#48-policy)). |
 | How should bounces work? | Reject in the session. The sending server is informed, using registered failure reasons, and reports to its user. Hubs pass failures back as DMS-signed DSNs ([Section 10.1](#101-failure-reporting-and-bounces)). |
+| Replay of signed mail (the DKIM-replay problem) | The signature is bound to hashed intended recipient domains (`rd=`), and any other domain must be reached through a signed redirect chain ([Section 6.6](#66-intended-recipients-rd)). |
+| Public CAs are dropping the clientAuth EKU | Relay clients use raw public keys in TLS. CA attestation travels in `Mail-Hop` `c=`, no EKU is required, and a dedicated EKU is requested ([Section 5.1](#51-certificates-and-extended-key-usage)). |
+| Forged `Mail-Delivered` or declarations injected by senders | Receivers strip them, and clients trust only the topmost `Mail-Delivered` from their own domain ([Sections 7.6](#76-final-delivery-mail-delivered) and [10.2](#102-verification-and-display-by-mail-clients)). |
+| Old mail failing verification after key rotation | `x=` now means retirement, not revocation. Certificates are checked at `t=`, and clients keep stored results ([Section 14.3](#143-key-compromise-rotation-and-historic-verification)). |
 | How are redirects shown? | A signed `Mail-Redirect` names the redirecting and new domains. The new domain signs `Mail-Delivered`, so mail clients can verify both ([Section 11.1](#111-redirection-mail-redirect)). |
 | What do servers keep? | Every server declares what it retains, per field, in a signed `Mail-Retention` header field ([Section 7.5](#75-data-retention-mail-retention)). |
 | DNSSEC? | RECOMMENDED for all DMS zones, mandatory validation for verifiers, and results shown to mail clients ([Section 4.11](#411-dnssec)). |

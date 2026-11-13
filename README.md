@@ -5,6 +5,20 @@
 - I am aware it wont ever get better. But I can dream.
 - This is just a weird thought in my head i wanted to write down.
 
+## The fix
+
+The proposed fix is **Domain Mail Signing (DMS)**, written up as an Internet-Draft in [`thefix/`](thefix/):
+
+- **[The proposed RFC](thefix/draft-findlay-mail-domain-signing-00.md)** has seven parts:
+  - **Domain keys:** each domain publishes its keys at `_mail.<domain>`, and each key is bound to a normal CA certificate.
+  - **SRV records:** they name the sending and receiving servers and carry the domain's policy.
+  - **Signed delivery path:** every hop adds a signed record to the message.
+  - **Retention declarations:** every server states what it keeps from the message.
+  - **Redirects:** both the redirecting domain and the new domain are recorded.
+  - **Optional user signatures:** individual users can sign their own mail.
+  - **Encryption only:** mail is only ever carried over encrypted connections.
+- **[What goes away](thefix/thefix.md)** lists the RFCs, DNS records and insecure mechanisms that stop being needed once everyone has switched. That includes SPF, DKIM, DMARC, ARC, STARTTLS, MTA-STS and DANE for SMTP, taking the stack from 161 RFCs to 140.
+
 ## The problem
 
 Sending an email looks simple. Doing it *correctly* in 2026 means implementing, or at least understanding, the documents listed below:
