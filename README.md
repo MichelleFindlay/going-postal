@@ -19,6 +19,47 @@ The proposed fix is **Domain Mail Signing (DMS)**, written up as an Internet-Dra
   - **Encryption only:** mail is only ever carried over encrypted connections.
 - **[What goes away](thefix/thefix.md)** lists the RFCs, DNS records and insecure mechanisms that stop being needed once everyone has switched. That includes SPF, DKIM, DMARC, ARC, STARTTLS, MTA-STS and DANE for SMTP, taking the stack from 161 RFCs to 140.
 
+### The stack at a glance
+
+With DMS, the same message needs one signing scheme, one transport rule and **four** DNS record sets: `_mail` and one SRV record set for each domain. Everything is encrypted and authenticated by default.
+
+```mermaid
+flowchart LR
+    subgraph SC["Sender's mail client"]
+        MUA1["Compose<br/>RFC 5322 + MIME<br/>Mail-User-Signature (optional)"]
+    end
+    subgraph SD["domain.uk"]
+        MSA["MSA<br/>submission 465, implicit TLS"]
+        MTA1["Sending server<br/>Mail-Signature with rd=<br/>Mail-Retention + Mail-Hop"]
+    end
+    HUB["Hub (optional)<br/>e.g. SES / Azure<br/>Mail-Retention + Mail-Hop"]
+    subgraph RD["recipient.example"]
+        MX["Receiving server<br/>verifies everything, rejects in session<br/>adds Mail-Retention + Mail-Delivered"]
+        MDA["MDA + Sieve filters"]
+    end
+    subgraph RC["Recipient's mail client"]
+        MUA2["Read<br/>IMAP 993 · POP3 995 · Exchange · JMAP<br/>shows verified path + what each server keeps"]
+    end
+    subgraph DNS1["DNS published by domain.uk (DNSSEC)"]
+        K1["_mail TXT<br/>keys + authorised hubs"]
+        SEND["_dms-send._tcp SRV<br/>sending hosts, return port,<br/>policy persistence"]
+    end
+    subgraph DNS2["DNS published by recipient.example (DNSSEC)"]
+        K2["_mail TXT<br/>keys"]
+        RECV["_dms-smtp._tcp SRV<br/>receiving servers + port"]
+    end
+
+    MUA1 --> MSA --> MTA1
+    MTA1 ==>|"DMS relay: TLS 1.3, both ends authenticated<br/>dedicated port, no fallback"| MX
+    MTA1 -.->|"or via hub"| HUB -.-> MX
+    MX --> MDA --> MUA2
+    MTA1 -.->|"find receiver"| RECV
+    MTA1 -.->|"confirm receiver key"| K2
+    MX -.->|"verify sender key"| K1
+    MX -.->|"confirm host + policy"| SEND
+    MX -.->|"failure reason"| MTA1
+```
+
 ### How a message flows
 
 Alice (`alice@domain.uk`) sends to Bob (`bob@recipient.example`). Mail travels either directly between the two domains' servers, or through a delivery hub that `domain.uk` has authorised.
@@ -109,18 +150,50 @@ Every RFC is checked in as plain text under [`rfc/`](rfc/) so the whole problem 
 
 ### The stack at a glance
 
+Today, a single message touches all of these. Most of the security pieces are optional, published in separate DNS records, and checked independently:
+
+```mermaid
+flowchart LR
+    subgraph SC["Sender's mail client"]
+        MUA1["Compose<br/>RFC 5322 + MIME<br/>S/MIME or OpenPGP (optional)"]
+    end
+    subgraph SD["domain.uk"]
+        MSA["MSA<br/>SMTP submission + AUTH<br/>587 STARTTLS or 465 TLS"]
+        MTA1["MTA<br/>DKIM signing"]
+    end
+    subgraph RD["recipient.example"]
+        MX["MX / MTA<br/>checks SPF, DKIM, DMARC, ARC<br/>adds Authentication-Results"]
+        MDA["MDA + Sieve filters"]
+    end
+    subgraph RC["Recipient's mail client"]
+        MUA2["Read<br/>IMAP 143 / 993 · POP3 110 / 995<br/>JMAP · Exchange"]
+    end
+    subgraph DNS1["DNS published by domain.uk"]
+        SPF["SPF TXT<br/>IP allow-list"]
+        DKIM["selector._domainkey TXT<br/>DKIM keys"]
+        DMARC["_dmarc TXT<br/>policy + report addresses"]
+    end
+    subgraph DNS2["DNS published by recipient.example"]
+        MXR["MX"]
+        STS["_mta-sts TXT<br/>+ HTTPS policy file"]
+        TLSA["TLSA (DANE)"]
+        RPT["_smtp._tls TXT<br/>TLS-RPT"]
+    end
+
+    MUA1 --> MSA --> MTA1
+    MTA1 -->|"SMTP port 25<br/>STARTTLS optional, can be stripped"| MX
+    MX --> MDA --> MUA2
+    MTA1 -.->|"route"| MXR
+    MTA1 -.->|"TLS policy"| STS
+    MTA1 -.->|"TLS pin"| TLSA
+    MTA1 -.->|"TLS failure reports"| RPT
+    MX -.->|"check IP"| SPF
+    MX -.->|"check signature"| DKIM
+    MX -.->|"check policy"| DMARC
+    MX -.->|"DMARC reports"| DMARC
 ```
-            ┌──────────────── MUA (mail client) ────────────────┐
-            │  compose / read: RFC 5322 + MIME, S/MIME, OpenPGP │
-            └───────┬───────────────────────────────▲───────────┘
-   submission       │ SMTP + AUTH (587 / 465)       │ IMAP4rev2 · JMAP · POP3
-   RFC 6409, 8314   ▼                               │ RFC 9051, 8620/8621, 1939
-            ┌───────────────┐   SMTP (25)    ┌──────┴────────┐
-            │   MSA / MTA   │ ─────────────▶ │  MTA → MDA    │──▶ Sieve filters
-            │ DKIM signing  │  STARTTLS,     │ SPF/DKIM/DMARC│    RFC 5228
-            └───────────────┘  MTA-STS, DANE │ ARC, Auth-Res │
-                               RFC 5321      └───────────────┘
-```
+
+**Four** ways to authenticate a sender, **five** ways to secure the hop between servers, **seven** kinds of DNS record plus a web server, and cleartext ports at every stage.
 
 ### RFCs by layer
 
