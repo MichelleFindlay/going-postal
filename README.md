@@ -19,6 +19,48 @@ The proposed fix is **Domain Mail Signing (DMS)**, written up as an Internet-Dra
   - **Encryption only:** mail is only ever carried over encrypted connections.
 - **[What goes away](thefix/thefix.md)** lists the RFCs, DNS records and insecure mechanisms that stop being needed once everyone has switched. That includes SPF, DKIM, DMARC, ARC, STARTTLS, MTA-STS and DANE for SMTP, taking the stack from 161 RFCs to 140.
 
+### How a message flows
+
+Alice (`alice@domain.uk`) sends to Bob (`bob@recipient.example`) through a delivery hub:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Alice's mail client
+    participant S as domain.uk<br/>sending server
+    participant H as Hub<br/>(e.g. SES / Azure)
+    participant DNS as DNS (DNSSEC)
+    participant R as recipient.example<br/>receiving server
+    participant B as Bob's mail client
+
+    A->>S: Submit over implicit TLS (465)<br/>+ optional Mail-User-Signature
+    S->>S: Add Mail-Signature (domain key, rd=recipients)<br/>+ Mail-Retention + Mail-Hop i=1
+    S->>H: DMS relay: TLS 1.3, both ends authenticated
+    H->>DNS: Look up _dms-smtp._tcp.recipient.example
+    DNS-->>H: Receiving servers + port
+    H->>R: DMS relay on the dedicated port<br/>+ Mail-Retention + Mail-Hop i=2
+    R->>DNS: Look up _mail keys, _dms-send hosts and policy
+    DNS-->>R: Keys, hosts, policy (DNSSEC-validated)
+    R->>R: Verify signature, certificate, rd=,<br/>every hop and every declaration
+    alt Verification fails
+        R-->>H: 550 5.7.x DMS <reason> (rejected in session)
+        H-->>S: Signed failure report to the sending host
+        S-->>A: Clear explanation of what failed
+    else Verification passes
+        R->>R: Add Mail-Retention + signed Mail-Delivered
+        R->>B: Deliver over IMAP / POP3 / Exchange / JMAP (TLS)
+        B->>B: Show the verified path and what each server keeps
+    end
+```
+
+In words:
+
+1. **Sending.** Alice's client sends over an encrypted connection and can add her personal signature. The `domain.uk` server signs with the domain key, records which domains the message is for, declares what it keeps, and adds the first signed hop.
+2. **Relaying.** Every connection is TLS 1.3, and both ends prove who they are with keys published in DNS. The hub finds Bob's receiving servers through SRV records, delivers on the dedicated DMS port, and adds its own signed hop and retention declaration.
+3. **Checking.** Bob's server checks everything before accepting: the sender's key and certificate, that the message was really addressed to it, every hop, and every declaration. Nothing is accepted first and bounced later.
+4. **Failing.** A rejection carries a clear, registered reason. It goes back along the authenticated path to the server that sent the message, which tells Alice what went wrong.
+5. **Delivering.** Bob's server adds its own declaration and a signed `Mail-Delivered`. Bob's client can then show who sent the message, every server it passed through, any redirects, whether DNSSEC protected it, and what each party keeps.
+
 ## The problem
 
 Sending an email looks simple. Doing it *correctly* in 2026 means implementing, or at least understanding, the documents listed below:
